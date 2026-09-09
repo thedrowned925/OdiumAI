@@ -15,11 +15,11 @@ import {
 } from 'lucide-react'
 import {
   MODE_DEFINITIONS,
-  consumeUsage,
   getLocalUserId,
   loadThreads,
   loadUsage,
   newThreadFromPrompt,
+  recordProviderUsage,
   saveThreads,
   streamOdiumResponse,
 } from './odiumEngine'
@@ -31,6 +31,7 @@ const MODE_ICONS = {
 }
 
 const makeMessageId = (suffix) => `${Date.now()}-${suffix}-${Math.random().toString(16).slice(2)}`
+const formatUsd = (value, digits = 4) => `$${Number(value || 0).toFixed(digits)}`
 
 function Wordmark() {
   return (
@@ -41,14 +42,14 @@ function Wordmark() {
   )
 }
 
-function UsageBar({ label, value }) {
+function UsageBar({ label, spent, limit, leftPercent }) {
   return (
     <div className="usage-item">
       <div className="usage-line">
         <span>{label}</span>
-        <strong>{value}% left</strong>
+        <strong>{formatUsd(spent)} / {formatUsd(limit, 2)}</strong>
       </div>
-      <div className="usage-bar"><span style={{ width: `${value}%` }} /></div>
+      <div className="usage-bar"><span style={{ width: `${leftPercent}%` }} /></div>
     </div>
   )
 }
@@ -95,7 +96,7 @@ function ModeMenu({ mode, depth, open, onToggle, onModeChange, onDepthChange }) 
             <div className="thinking-depth">
               <div>
                 <strong>Thinking depth</strong>
-                <small>High uses quota faster.</small>
+                <small>High may generate more thinking tokens.</small>
               </div>
               <div className="depth-control">
                 <button className={depth === 'medium' ? 'active' : ''} onClick={() => onDepthChange('medium')}>Medium</button>
@@ -128,6 +129,19 @@ function ThinkingBlock({ message }) {
   )
 }
 
+function UsageReceipt({ usage }) {
+  if (!usage) return null
+  const tokens = usage.tokens || {}
+  return (
+    <div className="message-usage">
+      <span>{Number(tokens.prompt || 0).toLocaleString()} in</span>
+      <span>{Number(tokens.output || 0).toLocaleString()} out</span>
+      {Number(tokens.thinking || 0) > 0 && <span>{Number(tokens.thinking).toLocaleString()} thinking</span>}
+      <strong>{formatUsd(usage.costUsd, 6)}</strong>
+    </div>
+  )
+}
+
 function Message({ message }) {
   if (message.role === 'user') {
     return <div className="message-row user"><div className="user-bubble">{message.content}</div></div>
@@ -140,6 +154,7 @@ function Message({ message }) {
         <ThinkingBlock message={message} />
         {message.content && <div className="assistant-text">{message.content}</div>}
         {!message.content && message.status !== 'thinking' && <span className="response-cursor" />}
+        <UsageReceipt usage={message.usage} />
       </div>
     </div>
   )
@@ -252,11 +267,30 @@ export default function App() {
             content: `${message.content}${event.text}`,
           }))
         }
+        if (event.type === 'usage') {
+          const recorded = recordProviderUsage(userId, {
+            provider: event.provider,
+            model: event.model,
+            usageMetadata: event.usageMetadata,
+          })
+          setUsage(recorded.usage)
+          patchAssistant(threadId, assistantId, (message) => ({
+            ...message,
+            usage: {
+              costUsd: recorded.event.nominalCostUsd,
+              tokens: {
+                prompt: recorded.event.usageMetadata.promptTokenCount,
+                output: recorded.event.usageMetadata.candidatesTokenCount,
+                thinking: recorded.event.usageMetadata.thoughtsTokenCount,
+                cached: recorded.event.usageMetadata.cachedContentTokenCount,
+              },
+            },
+          }))
+        }
         if (event.type === 'done') {
           patchAssistant(threadId, assistantId, (message) => ({ ...message, status: 'done' }))
         }
       }
-      setUsage(consumeUsage(userId, capturedMode, capturedDepth))
     } catch {
       patchAssistant(threadId, assistantId, (message) => ({
         ...message,
@@ -316,9 +350,9 @@ export default function App() {
 
         <div className="sidebar-footer">
           <div className="usage-panel">
-            <div className="usage-title">Usage</div>
-            <UsageBar label="5-hour" value={usage.fiveHour} />
-            <UsageBar label="Weekly" value={usage.weekly} />
+            <div className="usage-title">Nominal usage</div>
+            <UsageBar label="5-hour" spent={usage.fiveHourSpentUsd} limit={usage.fiveHourLimitUsd} leftPercent={usage.fiveHourLeftPercent} />
+            <UsageBar label="Weekly" spent={usage.weeklySpentUsd} limit={usage.weeklyLimitUsd} leftPercent={usage.weeklyLeftPercent} />
           </div>
 
           <button className="account-row">
@@ -388,7 +422,7 @@ export default function App() {
               <div className="composer-bottom">
                 <div className="composer-tools">
                   <button className="composer-icon" aria-label="Attach file"><Paperclip size={18} /></button>
-                  <span className="preview-label">Preview engine</span>
+                  <span className="preview-label">Preview · no provider charge</span>
                 </div>
 
                 <div className="composer-actions">
@@ -400,7 +434,7 @@ export default function App() {
               </div>
             </div>
 
-            <div className="composer-note">Odium can make mistakes. Provider-exposed thinking summaries may be shown when available.</div>
+            <div className="composer-note">Usage is metered from provider-reported input, output and thinking tokens. Preview requests do not consume quota.</div>
           </div>
         </section>
       </main>
