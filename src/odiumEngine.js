@@ -2,18 +2,18 @@ export const MODE_DEFINITIONS = {
   basic: {
     id: 'basic',
     label: 'Basic',
-    providerLabel: 'Gemini 3.8 Flash',
+    providerLabel: 'Gemini 3.6 Flash',
     thinkingLevel: 'Low',
-    quotaCost: 1,
-    description: 'Fast answers with the lowest quota usage.',
+    quotaCost: 0.25,
+    description: 'Fast answers with very low quota usage.',
     available: true,
   },
   thinking: {
     id: 'thinking',
     label: 'Thinking',
-    providerLabel: 'Gemini / Qwen',
+    providerLabel: 'Gemini 3.6 Flash / Qwen',
     thinkingLevel: 'Medium',
-    quotaCost: 3,
+    quotaCost: 2,
     description: 'Reasoning mode with adjustable thinking depth.',
     available: true,
   },
@@ -26,6 +26,28 @@ export const MODE_DEFINITIONS = {
     description: 'Maximum reasoning. Coming soon.',
     available: false,
   },
+}
+
+// Runtime targets for future provider adapters. These values are intentionally
+// conservative so Basic stays fast and does not burn through a provider quota.
+export const GEMINI_BASIC_PROFILE = {
+  provider: 'gemini',
+  model: 'gemini-3.6-flash',
+  thinkingLevel: 'low',
+  includeThinkingSummaries: false,
+  maxOutputTokens: 768,
+  historyTurns: 6,
+  retryLimit: 0,
+}
+
+export const GEMINI_THINKING_PROFILE = {
+  provider: 'gemini',
+  model: 'gemini-3.6-flash',
+  thinkingLevel: 'medium',
+  includeThinkingSummaries: true,
+  maxOutputTokens: 1536,
+  historyTurns: 10,
+  retryLimit: 0,
 }
 
 export const ODIUM_SYSTEM_IDENTITY = `You are Odium AI, the assistant inside the Odium product.
@@ -75,12 +97,13 @@ export function loadUsage(userId) {
 
 export function consumeUsage(userId, mode, thinkingDepth = 'medium') {
   const current = loadUsage(userId)
-  let cost = MODE_DEFINITIONS[mode]?.quotaCost ?? 1
-  if (mode === 'thinking' && thinkingDepth === 'high') cost = 6
+  let cost = MODE_DEFINITIONS[mode]?.quotaCost ?? 0.25
+  if (mode === 'thinking' && thinkingDepth === 'high') cost = 4
 
+  const weeklyCost = mode === 'basic' ? 0.1 : Math.max(0.5, cost / 2)
   const next = {
-    fiveHour: Math.max(0, current.fiveHour - cost),
-    weekly: Math.max(0, current.weekly - Math.max(1, Math.ceil(cost / 2))),
+    fiveHour: Math.max(0, Number((current.fiveHour - cost).toFixed(2))),
+    weekly: Math.max(0, Number((current.weekly - weeklyCost).toFixed(2))),
   }
   localStorage.setItem(usageKey(userId), JSON.stringify(next))
   return next
@@ -114,7 +137,7 @@ function buildPreviewAnswer(prompt) {
     return 'Ben Odium AI\'yım. Odium deneyimi içinde çalışan yapay zekâ asistanıyım.'
   }
 
-  return `Mesajını aldım: “${prompt.trim()}”\n\nOdium'un sohbet, geçmiş, streaming ve thinking arayüzü şu anda çalışıyor. Gerçek model sağlayıcıları henüz bu preview motoruna bağlanmadığı için bu yanıt yerel test motorundan geliyor. Bir sonraki aşamada Basic ve Thinking sağlayıcılarını aynı akışa bağlayacağız.`
+  return `Mesajını aldım: “${prompt.trim()}”\n\nOdium'un sohbet, geçmiş, streaming ve thinking arayüzü şu anda çalışıyor. Basic için Gemini 3.6 Flash hedef profili hazır; gerçek sağlayıcı bağlantısı henüz preview motoruna takılmadığı için bu yanıt yerel test motorundan geliyor.`
 }
 
 export async function* streamOdiumResponse({ prompt, mode, thinkingDepth = 'medium' }) {
