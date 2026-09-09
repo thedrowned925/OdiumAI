@@ -8,10 +8,10 @@ import {
   Paperclip,
   Search,
   Settings2,
+  Sparkles,
   SquarePen,
   X,
   Zap,
-  Sparkles,
 } from 'lucide-react'
 import {
   MODE_DEFINITIONS,
@@ -23,6 +23,7 @@ import {
   saveThreads,
   streamOdiumResponse,
 } from './odiumEngine'
+import ProviderSettings from './settings/ProviderSettings'
 
 const MODE_ICONS = {
   basic: Zap,
@@ -165,9 +166,10 @@ export default function App() {
   const [threads, setThreads] = useState(() => loadThreads(getLocalUserId()))
   const [currentThreadId, setCurrentThreadId] = useState(() => loadThreads(getLocalUserId())[0]?.id ?? null)
   const [sidebarOpen, setSidebarOpen] = useState(() => window.innerWidth > 860)
-  const [mode, setMode] = useState('thinking')
+  const [mode, setMode] = useState('basic')
   const [thinkingDepth, setThinkingDepth] = useState('medium')
   const [modeOpen, setModeOpen] = useState(false)
+  const [settingsOpen, setSettingsOpen] = useState(false)
   const [prompt, setPrompt] = useState('')
   const [searchOpen, setSearchOpen] = useState(false)
   const [searchQuery, setSearchQuery] = useState('')
@@ -179,11 +181,13 @@ export default function App() {
     () => threads.find((thread) => thread.id === currentThreadId) ?? null,
     [threads, currentThreadId],
   )
+
   const filteredThreads = useMemo(() => {
     const query = searchQuery.trim().toLocaleLowerCase('tr-TR')
     if (!query) return threads
     return threads.filter((thread) => thread.title.toLocaleLowerCase('tr-TR').includes(query))
   }, [threads, searchQuery])
+
   const currentMode = MODE_DEFINITIONS[mode]
   const CurrentModeIcon = MODE_ICONS[mode]
 
@@ -195,7 +199,10 @@ export default function App() {
   }
 
   const selectThread = (id) => {
+    const selected = threads.find((thread) => thread.id === id)
     setCurrentThreadId(id)
+    if (selected?.mode && MODE_DEFINITIONS[selected.mode]?.available) setMode(selected.mode)
+    if (selected?.thinkingDepth) setThinkingDepth(selected.thinkingDepth)
     if (window.innerWidth <= 860) setSidebarOpen(false)
   }
 
@@ -222,6 +229,10 @@ export default function App() {
 
     const capturedMode = mode
     const capturedDepth = thinkingDepth
+    const history = (currentThread?.messages || [])
+      .filter((message) => message.content)
+      .map((message) => ({ role: message.role, content: message.content }))
+
     const userMessage = { id: makeMessageId('user'), role: 'user', content: text, createdAt: Date.now() }
     const assistantId = makeMessageId('assistant')
     const assistantMessage = {
@@ -247,12 +258,23 @@ export default function App() {
       setCurrentThreadId(threadId)
     } else {
       setThreads((previous) => previous.map((thread) => thread.id === threadId
-        ? { ...thread, updatedAt: Date.now(), messages: [...thread.messages, userMessage, assistantMessage] }
+        ? {
+            ...thread,
+            mode: capturedMode,
+            thinkingDepth: capturedDepth,
+            updatedAt: Date.now(),
+            messages: [...thread.messages, userMessage, assistantMessage],
+          }
         : thread))
     }
 
     try {
-      for await (const event of streamOdiumResponse({ prompt: text, mode: capturedMode, thinkingDepth: capturedDepth })) {
+      for await (const event of streamOdiumResponse({
+        prompt: text,
+        mode: capturedMode,
+        thinkingDepth: capturedDepth,
+        messages: history,
+      })) {
         if (event.type === 'reasoning') {
           patchAssistant(threadId, assistantId, (message) => ({
             ...message,
@@ -260,6 +282,7 @@ export default function App() {
             reasoning: [...(message.reasoning || []), event.text],
           }))
         }
+
         if (event.type === 'answer') {
           patchAssistant(threadId, assistantId, (message) => ({
             ...message,
@@ -267,6 +290,7 @@ export default function App() {
             content: `${message.content}${event.text}`,
           }))
         }
+
         if (event.type === 'usage') {
           const recorded = recordProviderUsage(userId, {
             provider: event.provider,
@@ -287,6 +311,7 @@ export default function App() {
             },
           }))
         }
+
         if (event.type === 'done') {
           patchAssistant(threadId, assistantId, (message) => ({ ...message, status: 'done' }))
         }
@@ -308,6 +333,10 @@ export default function App() {
       sendPrompt()
     }
   }
+
+  const engineLabel = mode === 'basic'
+    ? 'Gemini route · preview fallback'
+    : 'Preview · provider pending'
 
   return (
     <div className="app-shell" onClick={closeMenus}>
@@ -355,9 +384,9 @@ export default function App() {
             <UsageBar label="Weekly" spent={usage.weeklySpentUsd} limit={usage.weeklyLimitUsd} leftPercent={usage.weeklyLeftPercent} />
           </div>
 
-          <button className="account-row">
+          <button className="account-row" onClick={() => setSettingsOpen(true)}>
             <span className="avatar">O</span>
-            <span className="account-copy"><strong>Local profile</strong><small>Private on this device</small></span>
+            <span className="account-copy"><strong>Local profile</strong><small>Providers & settings</small></span>
             <Settings2 size={16} />
           </button>
         </div>
@@ -382,7 +411,8 @@ export default function App() {
               }}
               onDepthChange={setThinkingDepth}
             />
-            <button className="icon-button"><MoreHorizontal size={18} /></button>
+            <button className="icon-button" onClick={() => setSettingsOpen(true)} aria-label="Open settings"><Settings2 size={18} /></button>
+            <button className="icon-button" aria-label="More options"><MoreHorizontal size={18} /></button>
           </div>
         </header>
 
@@ -397,7 +427,7 @@ export default function App() {
 
               <div className="suggestions">
                 <button onClick={() => setPrompt('Bana bugün üzerinde çalışabileceğim iyi bir proje fikri ver.')}><span>Start an idea</span><small>Brainstorm something useful</small></button>
-                <button onClick={() => { setMode('thinking'); setPrompt('Bu problemi adım adım değerlendir ve en iyi yaklaşımı özetle: ') }}><span>Think through a problem</span><small>Use reasoning mode</small></button>
+                <button onClick={() => { setMode('thinking'); setPrompt('Bu problemi değerlendir ve en iyi yaklaşımı özetle: ') }}><span>Think through a problem</span><small>Use reasoning mode</small></button>
                 <button onClick={() => setPrompt('Sen hangi modelsin?')}><span>Ask about Odium</span><small>Test product identity</small></button>
               </div>
             </div>
@@ -422,7 +452,7 @@ export default function App() {
               <div className="composer-bottom">
                 <div className="composer-tools">
                   <button className="composer-icon" aria-label="Attach file"><Paperclip size={18} /></button>
-                  <span className="preview-label">Preview · no provider charge</span>
+                  <span className="preview-label">{engineLabel}</span>
                 </div>
 
                 <div className="composer-actions">
@@ -434,10 +464,12 @@ export default function App() {
               </div>
             </div>
 
-            <div className="composer-note">Usage is metered from provider-reported input, output and thinking tokens. Preview requests do not consume quota.</div>
+            <div className="composer-note">Provider usage is metered from reported input, output and thinking tokens. Preview fallback does not consume quota.</div>
           </div>
         </section>
       </main>
+
+      <ProviderSettings open={settingsOpen} onClose={() => setSettingsOpen(false)} />
     </div>
   )
 }
