@@ -1,0 +1,25 @@
+.message-usage {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px 10px;
+  align-items: center;
+  margin-top: 10px;
+  color: var(--muted-2);
+  font-size: 11px;
+}
+
+.message-usage span {
+  white-space: nowrap;
+}
+
+.message-usage strong {
+  color: var(--muted);
+  font-weight: 600;
+}
+
+@media (max-width: 640px) {
+  .message-usage {
+    gap: 5px 8px;
+    font-size: 10px;
+  }
+}
