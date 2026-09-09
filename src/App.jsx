@@ -1,49 +1,36 @@
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import {
   ArrowUp,
   BrainCircuit,
   ChevronDown,
-  FileText,
-  History,
-  Image,
   Menu,
   MoreHorizontal,
   Paperclip,
   Search,
   Settings2,
-  Sparkles,
   SquarePen,
   X,
   Zap,
+  Sparkles,
 } from 'lucide-react'
+import {
+  MODE_DEFINITIONS,
+  consumeUsage,
+  getLocalUserId,
+  loadThreads,
+  loadUsage,
+  newThreadFromPrompt,
+  saveThreads,
+  streamOdiumResponse,
+} from './odiumEngine'
 
-const MODES = {
-  basic: {
-    label: 'Basic',
-    description: 'Fast, lightweight responses',
-    usage: 'Low usage',
-    icon: Zap,
-  },
-  thinking: {
-    label: 'Thinking',
-    description: 'Balanced reasoning for harder work',
-    usage: 'Medium usage',
-    icon: BrainCircuit,
-  },
-  ultra: {
-    label: 'Ultra Thinking',
-    description: 'Maximum reasoning for complex tasks',
-    usage: 'High usage',
-    icon: Sparkles,
-  },
+const MODE_ICONS = {
+  basic: Zap,
+  thinking: BrainCircuit,
+  ultra: Sparkles,
 }
 
-const conversations = [
-  { title: 'Design a launch strategy', time: '2m' },
-  { title: 'Refactor desktop agent flow', time: '1h' },
-  { title: 'Compare reasoning modes', time: '3h' },
-  { title: 'Landing page copy', time: 'Yesterday' },
-]
+const makeMessageId = (suffix) => `${Date.now()}-${suffix}-${Math.random().toString(16).slice(2)}`
 
 function Wordmark() {
   return (
@@ -54,68 +41,238 @@ function Wordmark() {
   )
 }
 
-function UsageBar({ label, value, detail }) {
+function UsageBar({ label, value }) {
   return (
     <div className="usage-item">
       <div className="usage-line">
         <span>{label}</span>
-        <strong>{detail}</strong>
+        <strong>{value}% left</strong>
       </div>
       <div className="usage-bar"><span style={{ width: `${value}%` }} /></div>
     </div>
   )
 }
 
-function ModeMenu({ mode, open, onToggle, onChange }) {
-  const current = MODES[mode]
-  const CurrentIcon = current.icon
+function ModeMenu({ mode, depth, open, onToggle, onModeChange, onDepthChange }) {
+  const current = MODE_DEFINITIONS[mode]
+  const CurrentIcon = MODE_ICONS[mode]
 
   return (
     <div className="mode-wrap" onClick={(event) => event.stopPropagation()}>
       <button className="mode-button" onClick={onToggle} aria-expanded={open}>
         <CurrentIcon size={15} />
         <span>{current.label}</span>
+        {mode === 'thinking' && <small>{depth === 'high' ? 'High' : 'Medium'}</small>}
         <ChevronDown size={14} className={open ? 'rotate' : ''} />
       </button>
 
       {open && (
         <div className="mode-menu">
-          <div className="mode-menu-title">Model mode</div>
-          {Object.entries(MODES).map(([key, item]) => {
-            const Icon = item.icon
+          <div className="mode-menu-title">Mode</div>
+          {Object.entries(MODE_DEFINITIONS).map(([key, item]) => {
+            const Icon = MODE_ICONS[key]
             const selected = key === mode
             return (
               <button
                 key={key}
-                className={`mode-row ${selected ? 'selected' : ''}`}
-                onClick={() => onChange(key)}
+                className={`mode-row ${selected ? 'selected' : ''} ${!item.available ? 'disabled' : ''}`}
+                onClick={() => item.available && onModeChange(key)}
+                disabled={!item.available}
               >
                 <span className="mode-row-icon"><Icon size={16} /></span>
                 <span className="mode-row-copy">
-                  <strong>{item.label}</strong>
+                  <span className="mode-row-title">
+                    <strong>{item.label}</strong>
+                    {!item.available && <em>Coming soon</em>}
+                  </span>
                   <small>{item.description}</small>
                 </span>
-                <span className="mode-row-usage">{item.usage}</span>
               </button>
             )
           })}
+
+          {mode === 'thinking' && (
+            <div className="thinking-depth">
+              <div>
+                <strong>Thinking depth</strong>
+                <small>High uses quota faster.</small>
+              </div>
+              <div className="depth-control">
+                <button className={depth === 'medium' ? 'active' : ''} onClick={() => onDepthChange('medium')}>Medium</button>
+                <button className={depth === 'high' ? 'active' : ''} onClick={() => onDepthChange('high')}>High</button>
+              </div>
+            </div>
+          )}
         </div>
       )}
     </div>
   )
 }
 
+function ThinkingBlock({ message }) {
+  if (!message.reasoning?.length && message.status !== 'thinking') return null
+
+  return (
+    <div className="thinking-block">
+      <div className="thinking-heading">
+        <BrainCircuit size={14} />
+        <span>{message.status === 'thinking' ? 'Thinking' : 'Thinking summary'}</span>
+        {message.status === 'thinking' && <span className="thinking-pulse" />}
+      </div>
+      {message.reasoning?.length > 0 && (
+        <div className="thinking-lines">
+          {message.reasoning.map((line, index) => <p key={`${line}-${index}`}>{line}</p>)}
+        </div>
+      )}
+    </div>
+  )
+}
+
+function Message({ message }) {
+  if (message.role === 'user') {
+    return <div className="message-row user"><div className="user-bubble">{message.content}</div></div>
+  }
+
+  return (
+    <div className="message-row assistant">
+      <div className="assistant-mark">O</div>
+      <div className="assistant-body">
+        <ThinkingBlock message={message} />
+        {message.content && <div className="assistant-text">{message.content}</div>}
+        {!message.content && message.status !== 'thinking' && <span className="response-cursor" />}
+      </div>
+    </div>
+  )
+}
+
 export default function App() {
+  const [userId] = useState(() => getLocalUserId())
+  const [threads, setThreads] = useState(() => loadThreads(getLocalUserId()))
+  const [currentThreadId, setCurrentThreadId] = useState(() => loadThreads(getLocalUserId())[0]?.id ?? null)
   const [sidebarOpen, setSidebarOpen] = useState(() => window.innerWidth > 860)
   const [mode, setMode] = useState('thinking')
+  const [thinkingDepth, setThinkingDepth] = useState('medium')
   const [modeOpen, setModeOpen] = useState(false)
   const [prompt, setPrompt] = useState('')
+  const [searchOpen, setSearchOpen] = useState(false)
+  const [searchQuery, setSearchQuery] = useState('')
+  const [usage, setUsage] = useState(() => loadUsage(getLocalUserId()))
+  const [isStreaming, setIsStreaming] = useState(false)
+  const endRef = useRef(null)
 
-  const currentMode = useMemo(() => MODES[mode], [mode])
-  const CurrentModeIcon = currentMode.icon
+  const currentThread = useMemo(
+    () => threads.find((thread) => thread.id === currentThreadId) ?? null,
+    [threads, currentThreadId],
+  )
+  const filteredThreads = useMemo(() => {
+    const query = searchQuery.trim().toLocaleLowerCase('tr-TR')
+    if (!query) return threads
+    return threads.filter((thread) => thread.title.toLocaleLowerCase('tr-TR').includes(query))
+  }, [threads, searchQuery])
+  const currentMode = MODE_DEFINITIONS[mode]
+  const CurrentModeIcon = MODE_ICONS[mode]
+
+  useEffect(() => saveThreads(userId, threads), [threads, userId])
+  useEffect(() => endRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' }), [currentThread?.messages, isStreaming])
 
   const closeMenus = () => {
     if (modeOpen) setModeOpen(false)
+  }
+
+  const selectThread = (id) => {
+    setCurrentThreadId(id)
+    if (window.innerWidth <= 860) setSidebarOpen(false)
+  }
+
+  const startNewChat = () => {
+    setCurrentThreadId(null)
+    setPrompt('')
+    if (window.innerWidth <= 860) setSidebarOpen(false)
+  }
+
+  const patchAssistant = (threadId, assistantId, patcher) => {
+    setThreads((previous) => previous.map((thread) => {
+      if (thread.id !== threadId) return thread
+      return {
+        ...thread,
+        updatedAt: Date.now(),
+        messages: thread.messages.map((message) => message.id === assistantId ? patcher(message) : message),
+      }
+    }))
+  }
+
+  const sendPrompt = async () => {
+    const text = prompt.trim()
+    if (!text || isStreaming || !currentMode.available) return
+
+    const capturedMode = mode
+    const capturedDepth = thinkingDepth
+    const userMessage = { id: makeMessageId('user'), role: 'user', content: text, createdAt: Date.now() }
+    const assistantId = makeMessageId('assistant')
+    const assistantMessage = {
+      id: assistantId,
+      role: 'assistant',
+      content: '',
+      reasoning: [],
+      status: capturedMode === 'thinking' ? 'thinking' : 'generating',
+      mode: capturedMode,
+      thinkingDepth: capturedDepth,
+      createdAt: Date.now(),
+    }
+
+    let threadId = currentThreadId
+    setPrompt('')
+    setIsStreaming(true)
+
+    if (!threadId) {
+      const created = newThreadFromPrompt(text, capturedMode, capturedDepth)
+      threadId = created.id
+      created.messages = [userMessage, assistantMessage]
+      setThreads((previous) => [created, ...previous])
+      setCurrentThreadId(threadId)
+    } else {
+      setThreads((previous) => previous.map((thread) => thread.id === threadId
+        ? { ...thread, updatedAt: Date.now(), messages: [...thread.messages, userMessage, assistantMessage] }
+        : thread))
+    }
+
+    try {
+      for await (const event of streamOdiumResponse({ prompt: text, mode: capturedMode, thinkingDepth: capturedDepth })) {
+        if (event.type === 'reasoning') {
+          patchAssistant(threadId, assistantId, (message) => ({
+            ...message,
+            status: 'thinking',
+            reasoning: [...(message.reasoning || []), event.text],
+          }))
+        }
+        if (event.type === 'answer') {
+          patchAssistant(threadId, assistantId, (message) => ({
+            ...message,
+            status: 'generating',
+            content: `${message.content}${event.text}`,
+          }))
+        }
+        if (event.type === 'done') {
+          patchAssistant(threadId, assistantId, (message) => ({ ...message, status: 'done' }))
+        }
+      }
+      setUsage(consumeUsage(userId, capturedMode, capturedDepth))
+    } catch {
+      patchAssistant(threadId, assistantId, (message) => ({
+        ...message,
+        status: 'done',
+        content: 'Bu isteği işlerken bir hata oluştu. Lütfen tekrar dene.',
+      }))
+    } finally {
+      setIsStreaming(false)
+    }
+  }
+
+  const handleKeyDown = (event) => {
+    if (event.key === 'Enter' && !event.shiftKey) {
+      event.preventDefault()
+      sendPrompt()
+    }
   }
 
   return (
@@ -129,24 +286,29 @@ export default function App() {
       <aside className={`sidebar ${sidebarOpen ? 'open' : 'closed'}`}>
         <div className="sidebar-header">
           <Wordmark />
-          <button className="icon-button sidebar-close" onClick={() => setSidebarOpen(false)} aria-label="Close sidebar">
-            <X size={18} />
-          </button>
+          <button className="icon-button sidebar-close" onClick={() => setSidebarOpen(false)} aria-label="Close sidebar"><X size={18} /></button>
         </div>
 
         <div className="sidebar-actions">
-          <button className="new-chat"><SquarePen size={16} /><span>New chat</span></button>
-          <button><Search size={16} /><span>Search</span></button>
-          <button><History size={16} /><span>Library</span></button>
+          <button className="new-chat" onClick={startNewChat}><SquarePen size={16} /><span>New chat</span></button>
+          <button onClick={() => setSearchOpen((value) => !value)}><Search size={16} /><span>Search</span></button>
         </div>
 
+        {searchOpen && (
+          <div className="sidebar-search">
+            <Search size={14} />
+            <input autoFocus value={searchQuery} onChange={(event) => setSearchQuery(event.target.value)} placeholder="Search chats" />
+          </div>
+        )}
+
         <div className="sidebar-content">
-          <div className="sidebar-label">Recent</div>
+          <div className="sidebar-label">Chats</div>
           <div className="conversation-list">
-            {conversations.map((item, index) => (
-              <button className={`conversation ${index === 0 ? 'active' : ''}`} key={item.title}>
-                <span>{item.title}</span>
-                <small>{item.time}</small>
+            {filteredThreads.length === 0 && <div className="empty-chats">No chats yet.</div>}
+            {filteredThreads.map((thread) => (
+              <button className={`conversation ${thread.id === currentThreadId ? 'active' : ''}`} key={thread.id} onClick={() => selectThread(thread.id)}>
+                <span>{thread.title}</span>
+                <small>{new Date(thread.updatedAt).toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}</small>
               </button>
             ))}
           </div>
@@ -155,13 +317,13 @@ export default function App() {
         <div className="sidebar-footer">
           <div className="usage-panel">
             <div className="usage-title">Usage</div>
-            <UsageBar label="5-hour" value={42} detail="58% left" />
-            <UsageBar label="Weekly" value={68} detail="32% left" />
+            <UsageBar label="5-hour" value={usage.fiveHour} />
+            <UsageBar label="Weekly" value={usage.weekly} />
           </div>
 
           <button className="account-row">
-            <span className="avatar">H</span>
-            <span className="account-copy"><strong>Hasan</strong><small>Odium Plus</small></span>
+            <span className="avatar">O</span>
+            <span className="account-copy"><strong>Local profile</strong><small>Private on this device</small></span>
             <Settings2 size={16} />
           </button>
         </div>
@@ -170,64 +332,75 @@ export default function App() {
       <main className="main-panel">
         <header className="topbar">
           <div className="topbar-left">
-            <button className="icon-button menu-button" onClick={() => setSidebarOpen(true)} aria-label="Open sidebar">
-              <Menu size={19} />
-            </button>
+            <button className="icon-button menu-button" onClick={() => setSidebarOpen(true)} aria-label="Open sidebar"><Menu size={19} /></button>
             <Wordmark />
           </div>
 
           <div className="topbar-right">
             <ModeMenu
               mode={mode}
+              depth={thinkingDepth}
               open={modeOpen}
               onToggle={() => setModeOpen((value) => !value)}
-              onChange={(nextMode) => {
+              onModeChange={(nextMode) => {
                 setMode(nextMode)
                 setModeOpen(false)
               }}
+              onDepthChange={setThinkingDepth}
             />
             <button className="icon-button"><MoreHorizontal size={18} /></button>
           </div>
         </header>
 
-        <section className="workspace">
-          <div className="welcome">
-            <p className="welcome-kicker">OdiumAI</p>
-            <h1>How can I help?</h1>
-            <p className="welcome-copy">Ask a question, work through an idea, or attach something you want to analyze.</p>
-          </div>
+        <section className={`workspace ${currentThread?.messages?.length ? 'has-chat' : ''}`}>
+          {!currentThread?.messages?.length ? (
+            <div className="welcome-wrap">
+              <div className="welcome">
+                <p className="welcome-kicker">Odium AI</p>
+                <h1>How can I help?</h1>
+                <p className="welcome-copy">A clean workspace for questions, ideas, files, and deeper reasoning.</p>
+              </div>
 
-          <div className="suggestions">
-            <button><FileText size={15} /><span>Analyze a document</span></button>
-            <button><BrainCircuit size={15} /><span>Work through a difficult problem</span></button>
-            <button><Image size={15} /><span>Explore a visual idea</span></button>
-          </div>
+              <div className="suggestions">
+                <button onClick={() => setPrompt('Bana bugün üzerinde çalışabileceğim iyi bir proje fikri ver.')}><span>Start an idea</span><small>Brainstorm something useful</small></button>
+                <button onClick={() => { setMode('thinking'); setPrompt('Bu problemi adım adım değerlendir ve en iyi yaklaşımı özetle: ') }}><span>Think through a problem</span><small>Use reasoning mode</small></button>
+                <button onClick={() => setPrompt('Sen hangi modelsin?')}><span>Ask about Odium</span><small>Test product identity</small></button>
+              </div>
+            </div>
+          ) : (
+            <div className="messages" aria-live="polite">
+              {currentThread.messages.map((message) => <Message message={message} key={message.id} />)}
+              <div ref={endRef} />
+            </div>
+          )}
 
           <div className="composer-area">
             <div className="composer">
               <textarea
                 value={prompt}
                 onChange={(event) => setPrompt(event.target.value)}
+                onKeyDown={handleKeyDown}
                 placeholder="Message Odium"
                 rows={1}
+                disabled={isStreaming}
               />
 
               <div className="composer-bottom">
                 <div className="composer-tools">
                   <button className="composer-icon" aria-label="Attach file"><Paperclip size={18} /></button>
-                  <button className="tools-button"><span>Tools</span><ChevronDown size={13} /></button>
+                  <span className="preview-label">Preview engine</span>
                 </div>
 
                 <div className="composer-actions">
-                  <span className="composer-mode"><CurrentModeIcon size={13} />{currentMode.label}</span>
-                  <button className={`send-button ${prompt.trim() ? 'ready' : ''}`} aria-label="Send message">
+                  <span className="composer-mode"><CurrentModeIcon size={13} />{currentMode.label}{mode === 'thinking' ? ` · ${thinkingDepth === 'high' ? 'High' : 'Medium'}` : ''}</span>
+                  <button className={`send-button ${prompt.trim() && !isStreaming ? 'ready' : ''}`} onClick={sendPrompt} disabled={!prompt.trim() || isStreaming || !currentMode.available} aria-label="Send message">
                     <ArrowUp size={18} />
                   </button>
                 </div>
               </div>
             </div>
 
-            <div className="composer-note">Odium can make mistakes. Check important information.</div>
+            <div className="composer-note">Odium can make mistakes. Provider-exposed thinking summaries may be shown when available.</div>
           </div>
         </section>
       </main>
