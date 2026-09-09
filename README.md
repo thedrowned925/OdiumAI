@@ -64,6 +64,8 @@ Open the Vite URL. In **Providers & settings**, the Gemini status should become 
 
 Never put `GEMINI_API_KEY` in a `VITE_*` variable, committed file, or frontend bundle. Deploy `server/index.js` on a Node 20+ backend and set its environment variables there. Point the static Odium frontend at that service with `VITE_ODIUM_API_BASE_URL` or through the Providers settings UI.
 
+For the included GitHub Pages workflow, create a repository Actions variable named `VITE_ODIUM_API_BASE_URL` whose value is the public HTTPS URL of the deployed Odium backend. The Pages build injects only that public URL; the Gemini API key must remain on the backend host.
+
 Set `ODIUM_ALLOWED_ORIGINS` to the browser origins that are allowed to call your backend. `ODIUM_REQUESTS_PER_MINUTE` controls the simple in-process rate limit; a public deployment should eventually add persistent rate limiting and user authentication before serving large traffic.
 
 ## API contract
