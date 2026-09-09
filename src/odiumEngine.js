@@ -1,3 +1,5 @@
+import { isGeminiConfigured, streamGeminiResponse } from './providers/geminiProvider'
+
 export const MODE_DEFINITIONS = {
   basic: {
     id: 'basic',
@@ -25,8 +27,6 @@ export const MODE_DEFINITIONS = {
   },
 }
 
-// Provider runtime targets. Basic deliberately stays conservative; real usage
-// is metered from provider token metadata rather than from mode multipliers.
 export const GEMINI_BASIC_PROFILE = {
   provider: 'gemini',
   model: 'gemini-3.6-flash',
@@ -53,9 +53,6 @@ Do not volunteer the names of underlying providers or routed engines in ordinary
 If a future product policy explicitly requires implementation transparency, describe Odium as a routed AI experience without exposing private credentials or account details.
 Never fabricate hidden chain-of-thought. Only surface reasoning summaries that a provider explicitly exposes to the application.`
 
-// Nominal paid-tier pricing is used for Odium metering even when our provider
-// account happens to be inside a free tier. This keeps usage fair and stable.
-// Source of truth: Google Gemini Developer API pricing for gemini-3.6-flash.
 export const GEMINI_36_FLASH_PRICING = {
   through2026: {
     effectiveUntil: '2026-12-31',
@@ -71,8 +68,6 @@ export const GEMINI_36_FLASH_PRICING = {
   },
 }
 
-// These are plan allowances, not model multipliers. They can later move to the
-// subscription backend without changing provider cost calculation.
 export const DEFAULT_USAGE_ALLOWANCES_USD = {
   fiveHour: 0.05,
   weekly: 0.4,
@@ -153,7 +148,6 @@ function loadUsageEvents(userId) {
 }
 
 function saveUsageEvents(userId, events) {
-  // Keep a bounded local ledger. Production storage will move server-side.
   localStorage.setItem(usageLedgerKey(userId), JSON.stringify(events.slice(-1000)))
 }
 
@@ -234,18 +228,47 @@ export function isIdentityQuestion(input) {
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
-function buildPreviewAnswer(prompt) {
-  if (isIdentityQuestion(prompt)) {
-    return 'Ben Odium AI\'yım. Odium deneyimi içinde çalışan yapay zekâ asistanıyım.'
+async function* streamText(text) {
+  for (const chunk of text.split(/(\s+)/)) {
+    await sleep(18)
+    yield { type: 'answer', text: chunk }
   }
-
-  return `Mesajını aldım: “${prompt.trim()}”\n\nOdium'un sohbet, geçmiş, streaming ve thinking arayüzü çalışıyor. Gerçek provider bağlantısı gelene kadar preview motoru ücret/kota tüketmez. Gemini bağlandığında kota doğrudan provider usageMetadata içindeki gerçek input, output ve thinking tokenlarına göre hesaplanacak.`
+  yield { type: 'done' }
 }
 
-export async function* streamOdiumResponse({ prompt, mode, thinkingDepth = 'medium' }) {
-  const shouldThink = mode === 'thinking'
+function buildPreviewAnswer(prompt) {
+  return `Mesajını aldım: “${prompt.trim()}”\n\nOdium'un sohbet, geçmiş, streaming ve thinking arayüzü çalışıyor. Basic provider bağlantısı hazır olduğunda bu istek otomatik olarak Gemini rotasına geçecek. Bağlantı yokken preview motoru ücret veya kota tüketmez.`
+}
 
-  yield { type: 'status', text: shouldThink ? 'Thinking' : 'Generating' }
+export async function* streamOdiumResponse({ prompt, mode, thinkingDepth = 'medium', messages = [], signal }) {
+  if (isIdentityQuestion(prompt)) {
+    yield { type: 'status', text: 'Odium' }
+    yield* streamText('Ben Odium AI\'yım. Odium deneyimi içinde çalışan yapay zekâ asistanıyım.')
+    return
+  }
+
+  if (mode === 'basic' && isGeminiConfigured()) {
+    let providerStarted = false
+    try {
+      yield { type: 'status', text: 'Gemini connected' }
+      for await (const event of streamGeminiResponse({
+        prompt,
+        messages,
+        thinkingDepth: 'low',
+        signal,
+      })) {
+        if (event.type === 'answer' || event.type === 'reasoning') providerStarted = true
+        yield event
+      }
+      return
+    } catch (error) {
+      if (providerStarted) throw error
+      yield { type: 'status', text: 'Provider unavailable · Preview fallback' }
+    }
+  }
+
+  const shouldThink = mode === 'thinking'
+  yield { type: 'status', text: shouldThink ? 'Thinking preview' : 'Preview' }
 
   if (shouldThink) {
     const summaries = thinkingDepth === 'high'
@@ -265,14 +288,5 @@ export async function* streamOdiumResponse({ prompt, mode, thinkingDepth = 'medi
     }
   }
 
-  const answer = buildPreviewAnswer(prompt)
-  const chunks = answer.split(/(\s+)/)
-  for (const chunk of chunks) {
-    await sleep(18)
-    yield { type: 'answer', text: chunk }
-  }
-
-  // Preview mode intentionally emits no usage event. Real provider adapters must
-  // emit { type: 'usage', provider, model, usageMetadata } from provider data.
-  yield { type: 'done' }
+  yield* streamText(buildPreviewAnswer(prompt))
 }
