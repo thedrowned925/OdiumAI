@@ -4,8 +4,7 @@ export const MODE_DEFINITIONS = {
     label: 'Basic',
     providerLabel: 'Gemini 3.6 Flash',
     thinkingLevel: 'Low',
-    quotaCost: 0.25,
-    description: 'Fast answers with very low quota usage.',
+    description: 'Fast answers with low thinking.',
     available: true,
   },
   thinking: {
@@ -13,7 +12,6 @@ export const MODE_DEFINITIONS = {
     label: 'Thinking',
     providerLabel: 'Gemini 3.6 Flash / Qwen',
     thinkingLevel: 'Medium',
-    quotaCost: 2,
     description: 'Reasoning mode with adjustable thinking depth.',
     available: true,
   },
@@ -22,14 +20,13 @@ export const MODE_DEFINITIONS = {
     label: 'Ultra Thinking',
     providerLabel: 'GPT-5.6 Sol',
     thinkingLevel: 'High',
-    quotaCost: 8,
     description: 'Maximum reasoning. Coming soon.',
     available: false,
   },
 }
 
-// Runtime targets for future provider adapters. These values are intentionally
-// conservative so Basic stays fast and does not burn through a provider quota.
+// Provider runtime targets. Basic deliberately stays conservative; real usage
+// is metered from provider token metadata rather than from mode multipliers.
 export const GEMINI_BASIC_PROFILE = {
   provider: 'gemini',
   model: 'gemini-3.6-flash',
@@ -56,9 +53,34 @@ Do not volunteer the names of underlying providers or routed engines in ordinary
 If a future product policy explicitly requires implementation transparency, describe Odium as a routed AI experience without exposing private credentials or account details.
 Never fabricate hidden chain-of-thought. Only surface reasoning summaries that a provider explicitly exposes to the application.`
 
+// Nominal paid-tier pricing is used for Odium metering even when our provider
+// account happens to be inside a free tier. This keeps usage fair and stable.
+// Source of truth: Google Gemini Developer API pricing for gemini-3.6-flash.
+export const GEMINI_36_FLASH_PRICING = {
+  through2026: {
+    effectiveUntil: '2026-12-31',
+    inputPerMillionUsd: 0.75,
+    outputPerMillionUsd: 3.75,
+    cachedInputPerMillionUsd: 0.075,
+  },
+  from2027: {
+    effectiveFrom: '2027-01-01',
+    inputPerMillionUsd: 1.5,
+    outputPerMillionUsd: 7.5,
+    cachedInputPerMillionUsd: 0.15,
+  },
+}
+
+// These are plan allowances, not model multipliers. They can later move to the
+// subscription backend without changing provider cost calculation.
+export const DEFAULT_USAGE_ALLOWANCES_USD = {
+  fiveHour: 0.05,
+  weekly: 0.4,
+}
+
 const USER_ID_KEY = 'odium.local-user-id'
 const threadKey = (userId) => `odium.threads.${userId}`
-const usageKey = (userId) => `odium.usage.${userId}`
+const usageLedgerKey = (userId) => `odium.usage-ledger.v2.${userId}`
 
 const makeId = () => {
   if (globalThis.crypto?.randomUUID) return globalThis.crypto.randomUUID()
@@ -86,27 +108,107 @@ export function saveThreads(userId, threads) {
   localStorage.setItem(threadKey(userId), JSON.stringify(threads))
 }
 
-export function loadUsage(userId) {
-  const fallback = { fiveHour: 100, weekly: 100 }
-  try {
-    return { ...fallback, ...JSON.parse(localStorage.getItem(usageKey(userId)) || '{}') }
-  } catch {
-    return fallback
+function pricingForDate(at = new Date()) {
+  const cutoff = new Date('2027-01-01T00:00:00Z')
+  return at < cutoff ? GEMINI_36_FLASH_PRICING.through2026 : GEMINI_36_FLASH_PRICING.from2027
+}
+
+export function calculateGemini36FlashCost(usageMetadata = {}, at = new Date()) {
+  const pricing = pricingForDate(at)
+  const promptTokens = Math.max(0, Number(usageMetadata.promptTokenCount || 0))
+  const cachedTokens = Math.min(promptTokens, Math.max(0, Number(usageMetadata.cachedContentTokenCount || 0)))
+  const uncachedTokens = Math.max(0, promptTokens - cachedTokens)
+  const outputTokens = Math.max(0, Number(usageMetadata.candidatesTokenCount || 0))
+  const thinkingTokens = Math.max(0, Number(usageMetadata.thoughtsTokenCount || 0))
+
+  const inputUsd = uncachedTokens * pricing.inputPerMillionUsd / 1_000_000
+  const cachedInputUsd = cachedTokens * pricing.cachedInputPerMillionUsd / 1_000_000
+  const outputUsd = (outputTokens + thinkingTokens) * pricing.outputPerMillionUsd / 1_000_000
+  const totalUsd = inputUsd + cachedInputUsd + outputUsd
+
+  return {
+    totalUsd,
+    inputUsd,
+    cachedInputUsd,
+    outputUsd,
+    tokens: {
+      prompt: promptTokens,
+      cached: cachedTokens,
+      uncached: uncachedTokens,
+      output: outputTokens,
+      thinking: thinkingTokens,
+      total: promptTokens + outputTokens + thinkingTokens,
+    },
+    rates: pricing,
   }
 }
 
-export function consumeUsage(userId, mode, thinkingDepth = 'medium') {
-  const current = loadUsage(userId)
-  let cost = MODE_DEFINITIONS[mode]?.quotaCost ?? 0.25
-  if (mode === 'thinking' && thinkingDepth === 'high') cost = 4
-
-  const weeklyCost = mode === 'basic' ? 0.1 : Math.max(0.5, cost / 2)
-  const next = {
-    fiveHour: Math.max(0, Number((current.fiveHour - cost).toFixed(2))),
-    weekly: Math.max(0, Number((current.weekly - weeklyCost).toFixed(2))),
+function loadUsageEvents(userId) {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(usageLedgerKey(userId)) || '[]')
+    return Array.isArray(parsed) ? parsed : []
+  } catch {
+    return []
   }
-  localStorage.setItem(usageKey(userId), JSON.stringify(next))
-  return next
+}
+
+function saveUsageEvents(userId, events) {
+  // Keep a bounded local ledger. Production storage will move server-side.
+  localStorage.setItem(usageLedgerKey(userId), JSON.stringify(events.slice(-1000)))
+}
+
+export function recordProviderUsage(userId, { provider, model, usageMetadata, at = new Date() }) {
+  if (provider !== 'gemini' || model !== 'gemini-3.6-flash') {
+    throw new Error(`No pricing profile registered for ${provider}/${model}`)
+  }
+
+  const calculated = calculateGemini36FlashCost(usageMetadata, at)
+  const event = {
+    id: makeId(),
+    timestamp: at.getTime(),
+    provider,
+    model,
+    nominalCostUsd: calculated.totalUsd,
+    usageMetadata: {
+      promptTokenCount: calculated.tokens.prompt,
+      cachedContentTokenCount: calculated.tokens.cached,
+      candidatesTokenCount: calculated.tokens.output,
+      thoughtsTokenCount: calculated.tokens.thinking,
+    },
+  }
+
+  const events = [...loadUsageEvents(userId), event]
+  saveUsageEvents(userId, events)
+  return { event, usage: summarizeUsageEvents(events, at) }
+}
+
+function summarizeUsageEvents(events, now = new Date()) {
+  const nowMs = now.getTime()
+  const fiveHourStart = nowMs - 5 * 60 * 60 * 1000
+  const weeklyStart = nowMs - 7 * 24 * 60 * 60 * 1000
+  const sum = (since) => events
+    .filter((event) => Number(event.timestamp) >= since)
+    .reduce((total, event) => total + Number(event.nominalCostUsd || 0), 0)
+
+  const fiveHourSpentUsd = sum(fiveHourStart)
+  const weeklySpentUsd = sum(weeklyStart)
+  const allTimeSpentUsd = events.reduce((total, event) => total + Number(event.nominalCostUsd || 0), 0)
+
+  return {
+    fiveHourSpentUsd,
+    weeklySpentUsd,
+    allTimeSpentUsd,
+    fiveHourLimitUsd: DEFAULT_USAGE_ALLOWANCES_USD.fiveHour,
+    weeklyLimitUsd: DEFAULT_USAGE_ALLOWANCES_USD.weekly,
+    fiveHourLeftPercent: Math.max(0, Math.min(100, 100 * (1 - fiveHourSpentUsd / DEFAULT_USAGE_ALLOWANCES_USD.fiveHour))),
+    weeklyLeftPercent: Math.max(0, Math.min(100, 100 * (1 - weeklySpentUsd / DEFAULT_USAGE_ALLOWANCES_USD.weekly))),
+    lastCostUsd: events.length ? Number(events[events.length - 1].nominalCostUsd || 0) : 0,
+    eventCount: events.length,
+  }
+}
+
+export function loadUsage(userId) {
+  return summarizeUsageEvents(loadUsageEvents(userId))
 }
 
 export function newThreadFromPrompt(prompt, mode, thinkingDepth) {
@@ -137,7 +239,7 @@ function buildPreviewAnswer(prompt) {
     return 'Ben Odium AI\'yım. Odium deneyimi içinde çalışan yapay zekâ asistanıyım.'
   }
 
-  return `Mesajını aldım: “${prompt.trim()}”\n\nOdium'un sohbet, geçmiş, streaming ve thinking arayüzü şu anda çalışıyor. Basic için Gemini 3.6 Flash hedef profili hazır; gerçek sağlayıcı bağlantısı henüz preview motoruna takılmadığı için bu yanıt yerel test motorundan geliyor.`
+  return `Mesajını aldım: “${prompt.trim()}”\n\nOdium'un sohbet, geçmiş, streaming ve thinking arayüzü çalışıyor. Gerçek provider bağlantısı gelene kadar preview motoru ücret/kota tüketmez. Gemini bağlandığında kota doğrudan provider usageMetadata içindeki gerçek input, output ve thinking tokenlarına göre hesaplanacak.`
 }
 
 export async function* streamOdiumResponse({ prompt, mode, thinkingDepth = 'medium' }) {
@@ -170,5 +272,7 @@ export async function* streamOdiumResponse({ prompt, mode, thinkingDepth = 'medi
     yield { type: 'answer', text: chunk }
   }
 
+  // Preview mode intentionally emits no usage event. Real provider adapters must
+  // emit { type: 'usage', provider, model, usageMetadata } from provider data.
   yield { type: 'done' }
 }
